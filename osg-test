@@ -1,0 +1,240 @@
+#!/usr/bin/python
+
+from distutils.sysconfig import get_python_lib
+from optparse import OptionParser
+import ConfigParser
+import os
+import re
+import signal
+import sys
+import traceback
+import unittest
+from getpass import getpass
+
+from osgtest.library import core
+from osgtest.library import osgunittest
+
+
+# ------------------------------------------------------------------------------
+# Functions
+# ------------------------------------------------------------------------------
+
+def parse_command_line():
+    defaults = {"adduser": False,
+                "backupmysql": False,
+                "config": None,
+                "dumpfile": None,
+                "dumpout": False,
+                "extrarepos": [],
+                "hostcert": False,
+                "packages": [],
+                "password": 'vdttest',
+                "printtest": True,
+                "securepass": False,
+                "skip_cleanup": False,
+                "skiptests": False,
+                "timeout": 5400,          # 1.5 hours
+                "updaterelease": None,
+                "updaterepos": [],
+                "username": 'vdttest',
+                "verbose": False,
+                "manualrun": False
+                }
+
+    # First pass through args to get config file
+    config_option = read_args()
+    (opts, args) = config_option.parse_args()
+        
+    if len(args) != 0:
+        config_option.error('unknown argument(s): %s' % ' '.join(args))
+    
+    # Read the config file
+    if opts.config:
+        config_file = ConfigParser.RawConfigParser()
+        try:
+            config_file.read(opts.config)
+        except ConfigParser.ParsingError, e:
+            sys.stderr.write("Error while parsing: %s\n%s\n" % (opts.config, e))
+            sys.stderr.write("Lines with options should not start with a space\n")
+            sys.exit(1)
+            
+        # Get union of config file values and defaults with the config values overriding any defaults
+        for key,value in config_file.items('Config'):
+            if key in defaults: 
+                if key == 'packages':
+                    defaults[key] = re.split(',\s*', value)
+                elif key == 'extrarepos':
+                    defaults[key] = re.split(',\s*', value)
+                elif key == 'updaterepos':
+                    defaults[key] = re.split(',\s*', value)
+                elif key == 'timeout':
+                    defaults[key] = config_file.getint('Config', key)
+                elif defaults[key] is False: # Grab values as booleans if we expect them to be
+                    defaults[key] = config_file.getboolean('Config', key)
+                elif key != 'config': # Ignore setting the config option through the config file
+                    defaults[key] = value
+            else:
+                defaults[key] = value
+        
+    # Read the rest of the command line options
+    parser = read_args()
+    parser.set_defaults(**defaults)
+    (core.options, args) = parser.parse_args()
+    
+    if core.options.updaterepos and not core.options.packages:
+        parser.error('The -g (--update-repo) option requires -i (--install).')
+
+def read_args():
+    script_description='''Tests an OSG Software RPM installation.'''
+    p = OptionParser(usage='usage: %prog [options]',
+                          version='%prog ##VERSION##',
+                          description=script_description)
+
+    p.add_option('-a', '--add-user', action='store_true', dest='adduser',
+                      help='Add and configure the test user account (see -u below)')
+
+    p.add_option('-c', '--config', action='store', type='string', dest='config',
+                       help='Configuration file to use that specifies command-line options')
+
+    p.add_option('-d', '--dump-output', action='store_true',
+                      dest='dumpout', help='After test output, print all command output')
+    
+    p.add_option('--dump-file', '--df', action='store', type='string', dest='dumpfile', metavar='DUMPFILE',
+                      help='Store all command output into DUMPFILE')
+
+    p.add_option('-i', '--install', action='append', dest='packages',
+                      metavar='PACKAGE',
+                      help='Install PACKAGE with yum before running tests')
+
+    p.add_option('-g','--update-repo', action='append', type='string', dest='updaterepos', metavar='REPO',
+                      help='REPO to use when updating packages '
+                      'specified with the -i flag.')
+
+    p.add_option('-m', '--manual-run', action='store_true', dest='manualrun',
+                      help='Speeds up osg-test in the case where it is '
+                      'run by hand. May not be suitable when running '
+                      'multiple instances of osg-test at once.')
+    
+    p.add_option('-n', '--no-cleanup', action='store_true', dest='skip_cleanup',
+                       help='Skip clean-up steps after all tests are done')
+
+    p.add_option('-p', '--password', action='store', type='string',
+                      dest='password',
+                      help='Password for the grid certificate of the test user '
+                      '(see -u below)')
+
+    p.add_option('-s', '--securepass', action='store_true', dest='securepass',
+                 help='Prompt for the password instead of specifying it in the command line.')
+
+    p.add_option('--update-release', action='store', type='string', dest='updaterelease', metavar='RELEASE',
+                      help='osg RELEASE version to use when updating packages '
+                      'specified with the -i flag.')
+
+    p.add_option('-r', '--extra-repo', action='append', type='string',
+                      dest='extrarepos', metavar='REPO',
+                      help='Extra REPO (in addition to production) to use'
+                      ' when installing packages')
+
+    p.add_option('--no-print-test-name', action='store_false', dest='printtest',
+                       help='Do not print test name before command output')
+
+    p.add_option('-T', '--skip', '--skip-tests', '--no-tests', '--notests',
+                      action='store_true', dest='skiptests',
+                      help='Do not run the functional tests; ' +
+                      'can enable install and cleanup separately')
+
+    p.add_option('-u', '--test-user', action='store', type='string',
+                      dest='username', metavar='NAME',
+                      help='The NAME of an unprivileged user account that can '
+                      'be used to run (some) test commands (default: vdttest)')
+
+    p.add_option('-v', '--verbose', action='store_true', dest='verbose',
+                      help='Increase quantity of output')
+
+    p.add_option('--hostcert', action='store_true', dest='hostcert',
+                      help='Create host cert')
+
+    return p
+
+def get_password():
+    if core.options.securepass:
+        # If the user also specifies password on the command line, we complain
+        if core.options.password != 'vdttest':
+            print 'Only specify one of --password and --securepass'
+            sys.exit(1)
+        core.options.password = getpass()
+
+def discover_tests():
+    test_dir = os.path.join(get_python_lib(), 'osgtest', 'tests')
+    test_files = ['osgtest.tests.' + d[:-3] for d in os.listdir(test_dir)
+                  if d.startswith('test_') and d.endswith('.py')]
+    test_files.sort()
+    args = []
+    args.append('osgtest.tests.special_certs')
+    args.append('osgtest.tests.special_user') # always safe
+    if len(core.options.packages) > 0:
+        args.append('osgtest.tests.special_install')
+    if not core.options.skiptests:
+        args += test_files
+    if not core.options.skip_cleanup:
+        args.append('osgtest.tests.special_cleanup') # always safe
+    return args
+
+def run_tests(a_argv):
+    if core.options.verbose:
+        verb = 2
+    else:
+        verb = 1
+    test_suite = unittest.defaultTestLoader.loadTestsFromNames(a_argv)
+    runner = osgunittest.OSGTextTestRunner(verbosity=verb)
+    runner.run(test_suite)
+
+def wrap_up():
+    core.end_log()
+    if core.options.dumpout:
+        core.dump_log()
+    if core.options.dumpfile:
+        core.dump_log(core.options.dumpfile)
+    core.remove_log()
+
+def signal_alarm_handler(signal_number, stack_frame):
+    if stack_frame is not None:
+        core.log_message('\nCaught alarm:\n' + ''.join(traceback.format_stack(None)))
+    wrap_up()
+
+    # Use a hard abort here, because sys.exit() just raises an exception, which
+    # is caught by the runner, which then cheerfully continues running all tests
+    os.abort()
+
+def add_cleanup(tests):
+    if not core.options.skip_cleanup:
+        if core.options.tarballs:
+            tests.append('osgtest.tarball_tests.special_cleanup')
+        tests.append('osgtest.tests.special_cleanup') # always safe
+    
+# ------------------------------------------------------------------------------
+# MAIN
+# ------------------------------------------------------------------------------
+
+if __name__ == '__main__':
+    parse_command_line()
+    if os.getuid() != 0:
+        print 'Must be run as root'
+        sys.exit(1)
+    get_password()
+    core.start_log()
+    tests = discover_tests()
+    if len(tests) > 1:
+        signal.signal(signal.SIGALRM, signal_alarm_handler)
+        signal.alarm(core.options.timeout)
+        try:
+            run_tests(tests)
+        except KeyboardInterrupt:
+            tests = []
+            add_cleanup(tests)
+            run_tests(tests)
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, signal.SIG_DFL)
+    else:
+        print 'No tests to run.'
+    wrap_up()
